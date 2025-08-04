@@ -115,11 +115,42 @@ class DockerDeployment(AbstractDeployment):
 
     def _get_swerex_start_cmd(self, token: str) -> list[str]:
         rex_args = f"--auth-token {token}"
-        pipx_install = "python3 -m pip install pipx && python3 -m pipx ensurepath"
         if self._config.python_standalone_dir:
             cmd = f"{self._config.python_standalone_dir}/python3.11/bin/{REMOTE_EXECUTABLE_NAME} {rex_args}"
         else:
-            cmd = f"{REMOTE_EXECUTABLE_NAME} {rex_args} || ({pipx_install} && pipx run {PACKAGE_NAME} {rex_args})"
+            # Fallback chain when swerex-remote is not available in the container
+            # Note: SWE-ReX requires Python 3.10+, we will upgrade Python if needed
+            
+            # 1. Ensure python3 and basic tools exist
+            ensure_python = "command -v python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y python3)"
+            ensure_tools = "apt-get update && apt-get install -y software-properties-common curl"
+            
+            # 2. Check if Python upgrade is needed and upgrade to 3.10 if necessary
+            check_python_version = "python3 -c 'import sys; exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null"
+            upgrade_python = (
+                "echo 'Python < 3.10 detected, upgrading to Python 3.10...' && "
+                "add-apt-repository ppa:deadsnakes/ppa -y && "
+                "apt-get update && "
+                "apt-get install -y python3.10 python3.10-venv python3.10-dev python3.10-distutils && "
+                "rm -f /usr/bin/python3 && ln -s /usr/bin/python3.10 /usr/bin/python3 && "
+                "([ -f /usr/local/bin/python3 ] && (rm -f /usr/local/bin/python3 && ln -s /usr/bin/python3.10 /usr/local/bin/python3) || true) && "
+                "curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3 get-pip.py && rm -f get-pip.py"
+            )
+            
+            # 3. Final Python version check (must be 3.10+ after upgrade)
+            final_version_check = "python3 -c 'import sys; exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null"
+            version_error_msg = "echo 'ERROR: Failed to upgrade Python to 3.10+. Current version:' && python3 --version && exit 1"
+            
+            # 4. Install and use pipx (only method, no pip fallback)
+            install_pipx = "python3 -m pip install --user pipx"
+            run_swerex = f"python3 -m pipx run {PACKAGE_NAME} {rex_args}"
+            
+            cmd = (
+                f"{REMOTE_EXECUTABLE_NAME} {rex_args} || "
+                f"(({ensure_python} && {ensure_tools} && "
+                f"({check_python_version} || {upgrade_python}) && "
+                f"{final_version_check} && {install_pipx} && {run_swerex}) || {version_error_msg})"
+            )
         # Need to wrap with /bin/sh -c to avoid having '&&' interpreted by the parent shell
         return [
             "/bin/sh",
@@ -272,21 +303,23 @@ class DockerDeployment(AbstractDeployment):
 
     async def stop(self):
         """Stops the runtime."""
-        if self._runtime is not None:
+        if hasattr(self, '_runtime') and self._runtime is not None:
             await self._runtime.close()
             self._runtime = None
 
-        if self._container_process is not None:
+        if hasattr(self, '_container_process') and self._container_process is not None:
             try:
-                subprocess.check_call(
-                    ["docker", "kill", self._container_name],  # type: ignore
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10,
-                )
+                if hasattr(self, '_container_name') and self._container_name:
+                    subprocess.check_call(
+                        ["docker", "kill", self._container_name],  # type: ignore
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                container_name = getattr(self, '_container_name', 'unknown')
                 self.logger.warning(
-                    f"Failed to kill container {self._container_name}: {e}. Will try harder.", exc_info=False
+                    f"Failed to kill container {container_name}: {e}. Will try harder.", exc_info=False
                 )
             for _ in range(3):
                 self._container_process.kill()
@@ -296,18 +329,21 @@ class DockerDeployment(AbstractDeployment):
                 except subprocess.TimeoutExpired:
                     continue
             else:
-                self.logger.warning(f"Failed to kill container {self._container_name} with SIGKILL")
+                container_name = getattr(self, '_container_name', 'unknown')
+                self.logger.warning(f"Failed to kill container {container_name} with SIGKILL")
 
             self._container_process = None
-            self._container_name = None
+            if hasattr(self, '_container_name'):
+                self._container_name = None
 
-        if self._config.remove_images:
-            if _is_image_available(self._config.image):
-                self.logger.info(f"Removing image {self._config.image}")
+        if hasattr(self, '_config') and self._config and getattr(self._config, 'remove_images', False):
+            image_name = getattr(self._config, 'image', None)
+            if image_name and _is_image_available(image_name):
+                self.logger.info(f"Removing image {image_name}")
                 try:
-                    _remove_image(self._config.image)
+                    _remove_image(image_name)
                 except subprocess.CalledProcessError:
-                    self.logger.error(f"Failed to remove image {self._config.image}", exc_info=True)
+                    self.logger.error(f"Failed to remove image {image_name}", exc_info=True)
 
     @property
     def runtime(self) -> RemoteRuntime:
@@ -316,6 +352,6 @@ class DockerDeployment(AbstractDeployment):
         Raises:
             DeploymentNotStartedError: If the deployment was not started.
         """
-        if self._runtime is None:
+        if not hasattr(self, '_runtime') or self._runtime is None:
             raise DeploymentNotStartedError()
         return self._runtime
